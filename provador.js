@@ -1,6 +1,6 @@
 /*!
  * Provador virtual de quadros — Maperia
- * Versão 0.4.0 (troca de produto + foto da simulação; modo teste) — 26/11/2026
+ * Versão 0.5.0 (quadro preso na parede, tamanho estimado, foto congelada; modo teste) — 26/11/2026
  *
  * Instalação: Google Tag Manager, tag "HTML personalizado" (ver README.md).
  * Tudo roda no navegador do visitante: nada é enviado a servidores,
@@ -13,7 +13,7 @@
   'use strict';
 
   if (window.__maperiaProvador) { return; }
-  var API = window.__maperiaProvador = { versao: '0.4.0' };
+  var API = window.__maperiaProvador = { versao: '0.5.0' };
 
   /* =====================================================================
    * CONFIGURAÇÃO CENTRAL
@@ -49,7 +49,11 @@
     modoTeste: true,
     corPadrao: '#00b4ef',      // azul da loja, usado se não der para ler a cor do botão Comprar
     alturaInicialTela: 0.42,   // no modo aproximado, o quadro abre com 42% da altura da tela
-    maxImagensAnalisadas: 14   // limite de fotos da galeria testadas atrás da foto isolada
+    maxImagensAnalisadas: 14,  // limite de fotos da galeria testadas atrás da foto isolada
+    // estimativa automática de tamanho (câmera ao vivo). São suposições médias, não medidas:
+    campoVisaoGraus: 69,       // campo de visão da câmera principal no lado maior da imagem (celulares ~26 mm)
+    alturaCelularCm: 130,      // altura típica do celular na mão, em pé
+    distanciaPadraoCm: 250     // distância usada quando não dá para estimar
   };
 
   /* =====================================================================
@@ -570,6 +574,8 @@
       '.previa img{max-width:100%;max-height:100%;border-radius:10px;box-shadow:0 10px 30px #0009;-webkit-touch-callout:default;-webkit-user-select:auto;user-select:auto}' +
       '.previa .dica{margin:10px 0 0;text-align:center;font-size:12.5px;color:#ffffffa6}' +
       '.previa .linhaBtns{margin-top:12px}' +
+      '.rastro{position:absolute;left:50%;transform:translateX(-50%);top:calc(112px + env(safe-area-inset-top));z-index:4;padding:5px 10px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap;background:#0c0e11b3;color:#ffffffd9;pointer-events:none}' +
+      '.rastro.ok{color:#9ff0c0}.rastro.busca{color:#ffd98a}' +
       '.verLoja{flex:0 0 auto;padding:9px 12px;border-radius:999px;background:' + cor + ';color:#fff;font-size:12.5px;font-weight:700;text-decoration:none;white-space:nowrap}' +
       '.folha{position:absolute;inset:0;z-index:10;background:#0008;display:flex;flex-direction:column;justify-content:flex-end}' +
       '.folha .caixa{background:#14171b;border-radius:20px 20px 0 0;padding:16px 16px calc(16px + env(safe-area-inset-bottom));max-height:78%;display:flex;flex-direction:column}' +
@@ -606,6 +612,232 @@
     baixar: '<path d="M12 4v11M7 10l5 5 5-5"/><path d="M5 20h14"/>',
     quadros: '<rect x="3" y="5" width="8" height="12" rx="1"/><rect x="13" y="7" width="8" height="10" rx="1"/><path d="M3 21h18"/>'
   };
+
+  /* =====================================================================
+   * Rastreador: mantém o quadro "preso" na parede com a câmera ao vivo.
+   * Segue pontos de detalhe da imagem (Lucas-Kanade em pirâmide, em JS puro,
+   * numa cópia pequena do vídeo) e calcula quanto a imagem andou e aproximou
+   * (translação + escala). Nada sai do aparelho.
+   * ===================================================================== */
+  function amostra(I, w, h, x, y) {
+    if (x < 0) { x = 0; } else if (x > w - 1.001) { x = w - 1.001; }
+    if (y < 0) { y = 0; } else if (y > h - 1.001) { y = h - 1.001; }
+    var x0 = x | 0, y0 = y | 0, ax = x - x0, ay = y - y0, i = y0 * w + x0;
+    return (I[i] * (1 - ax) + I[i + 1] * ax) * (1 - ay) + (I[i + w] * (1 - ax) + I[i + w + 1] * ax) * ay;
+  }
+  function reduzir(img) {
+    var w = img.w >> 1, h = img.h >> 1, d = new Float32Array(w * h), s = img.d, W = img.w;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var i = (2 * y) * W + 2 * x;
+        d[y * w + x] = (s[i] + s[i + 1] + s[i + W] + s[i + W + 1]) * 0.25;
+      }
+    }
+    return { d: d, w: w, h: h };
+  }
+  function mediana(a) {
+    if (!a.length) { return NaN; }
+    a.sort(function (x, y) { return x - y; });
+    return a[a.length >> 1];
+  }
+  // cantos fortes (Shi-Tomasi), no máximo 1 por célula da grade
+  function detectarCantos(img, max) {
+    var w = img.w, h = img.h, I = img.d, W1 = w + 1;
+    var sxx = new Float64Array(W1 * (h + 1)), syy = new Float64Array(W1 * (h + 1)), sxy = new Float64Array(W1 * (h + 1));
+    for (var y = 0; y < h; y++) {
+      var rx = 0, ry = 0, rxy = 0;
+      for (var x = 0; x < w; x++) {
+        var gx = 0, gy = 0;
+        if (x > 0 && x < w - 1 && y > 0 && y < h - 1) {
+          gx = (I[y * w + x + 1] - I[y * w + x - 1]) * 0.5;
+          gy = (I[(y + 1) * w + x] - I[(y - 1) * w + x]) * 0.5;
+        }
+        rx += gx * gx; ry += gy * gy; rxy += gx * gy;
+        var k = (y + 1) * W1 + x + 1;
+        sxx[k] = sxx[k - W1] + rx; syy[k] = syy[k - W1] + ry; sxy[k] = sxy[k - W1] + rxy;
+      }
+    }
+    function soma(S, x0, y0, x1, y1) { return S[y1 * W1 + x1] - S[y0 * W1 + x1] - S[y1 * W1 + x0] + S[y0 * W1 + x0]; }
+    var cel = 10, R = 2, cand = [], maior = 0;
+    for (var cy = 6; cy < h - 6; cy += cel) {
+      for (var cx = 6; cx < w - 6; cx += cel) {
+        var melhor = 0, bx = -1, by = -1;
+        for (var yy = cy; yy < Math.min(cy + cel, h - 6); yy++) {
+          for (var xx = cx; xx < Math.min(cx + cel, w - 6); xx++) {
+            var a = soma(sxx, xx - R, yy - R, xx + R + 1, yy + R + 1), c = soma(syy, xx - R, yy - R, xx + R + 1, yy + R + 1), b = soma(sxy, xx - R, yy - R, xx + R + 1, yy + R + 1);
+            var l = (a + c) * 0.5 - Math.sqrt((a - c) * (a - c) * 0.25 + b * b);
+            if (l > melhor) { melhor = l; bx = xx; by = yy; }
+          }
+        }
+        if (bx >= 0) { cand.push([bx, by, melhor]); if (melhor > maior) { maior = melhor; } }
+      }
+    }
+    var lim = Math.max(maior * 0.03, 30), out = [];
+    cand.sort(function (p, q) { return q[2] - p[2]; });
+    for (var i = 0; i < cand.length && out.length < max; i++) { if (cand[i][2] >= lim) { out.push([cand[i][0], cand[i][1]]); } }
+    return out;
+  }
+  // Lucas-Kanade em 2 níveis para um ponto; devolve [x, y] ou null
+  function seguirPonto(A, B, x, y, px, py) {
+    var R = 4, dx = px * 0.5, dy = py * 0.5, Iw = new Float32Array(81), Ix = new Float32Array(81), Iy = new Float32Array(81), erro = 0;
+    for (var L = 1; L >= 0; L--) {
+      var P = A[L], C = B[L], s = L ? 0.5 : 1, cx = x * s, cy = y * s, gxx = 0, gyy = 0, gxy = 0, k = 0, i, j;
+      for (j = -R; j <= R; j++) {
+        for (i = -R; i <= R; i++, k++) {
+          var ix = (amostra(P.d, P.w, P.h, cx + i + 1, cy + j) - amostra(P.d, P.w, P.h, cx + i - 1, cy + j)) * 0.5;
+          var iy = (amostra(P.d, P.w, P.h, cx + i, cy + j + 1) - amostra(P.d, P.w, P.h, cx + i, cy + j - 1)) * 0.5;
+          Iw[k] = amostra(P.d, P.w, P.h, cx + i, cy + j); Ix[k] = ix; Iy[k] = iy;
+          gxx += ix * ix; gyy += iy * iy; gxy += ix * iy;
+        }
+      }
+      var det = gxx * gyy - gxy * gxy;
+      if (det < 1e-2) { return null; }
+      for (var it = 0; it < 10; it++) {
+        var b1 = 0, b2 = 0; erro = 0; k = 0;
+        for (j = -R; j <= R; j++) {
+          for (i = -R; i <= R; i++, k++) {
+            var d = amostra(C.d, C.w, C.h, cx + i + dx, cy + j + dy) - Iw[k];
+            b1 += d * Ix[k]; b2 += d * Iy[k]; erro += d < 0 ? -d : d;
+          }
+        }
+        var ux = -(gyy * b1 - gxy * b2) / det, uy = -(gxx * b2 - gxy * b1) / det;
+        dx += ux; dy += uy;
+        if (ux * ux + uy * uy < 0.0009) { break; }
+      }
+      if (L) { dx *= 2; dy *= 2; }
+    }
+    var nx = x + dx, ny = y + dy;
+    if (nx < 3 || ny < 3 || nx > A[0].w - 4 || ny > A[0].h - 4 || erro / 81 > 16) { return null; }
+    return [nx, ny];
+  }
+  // movimento da imagem: escala s + translação (sem rotação), robusto a pontos errados
+  function ajustarMovimento(a, b) {
+    var n = a.length, i, j;
+    if (n < 8) { return null; }
+    var raz = [];
+    for (var k = 0; k < Math.min(400, n * 6); k++) {
+      i = (Math.random() * n) | 0; j = (Math.random() * n) | 0;
+      var da = Math.hypot(a[i][0] - a[j][0], a[i][1] - a[j][1]);
+      if (da > 10) { raz.push(Math.hypot(b[i][0] - b[j][0], b[i][1] - b[j][1]) / da); }
+    }
+    var s = raz.length > 5 ? mediana(raz) : 1;
+    var txs = [], tys = [];
+    for (i = 0; i < n; i++) { txs.push(b[i][0] - s * a[i][0]); tys.push(b[i][1] - s * a[i][1]); }
+    var tx = mediana(txs), ty = mediana(tys), dentro = [];
+    for (var volta = 0; volta < 2; volta++) {
+      dentro = [];
+      for (i = 0; i < n; i++) { if (Math.hypot(b[i][0] - (s * a[i][0] + tx), b[i][1] - (s * a[i][1] + ty)) < 1.6) { dentro.push(i); } }
+      if (dentro.length < 8) { return null; }
+      var ax = 0, ay = 0, bx = 0, by = 0, m = dentro.length;
+      for (i = 0; i < m; i++) { ax += a[dentro[i]][0]; ay += a[dentro[i]][1]; bx += b[dentro[i]][0]; by += b[dentro[i]][1]; }
+      ax /= m; ay /= m; bx /= m; by /= m;
+      var num = 0, den = 0;
+      for (i = 0; i < m; i++) {
+        var p = a[dentro[i]], q = b[dentro[i]];
+        num += (p[0] - ax) * (q[0] - bx) + (p[1] - ay) * (q[1] - by); den += (p[0] - ax) * (p[0] - ax) + (p[1] - ay) * (p[1] - ay);
+      }
+      if (den > 1) { s = num / den; }
+      tx = bx - s * ax; ty = by - s * ay;
+    }
+    if (s < 0.85 || s > 1.18 || dentro.length < Math.max(8, n * 0.35)) { return null; }
+    return { s: s, tx: tx, ty: ty, dentro: dentro };
+  }
+
+  function Rastreador(prov) {
+    this.p = prov; this.ativo = false; this.lado = 240;
+    this.cv = document.createElement('canvas');
+    try { this.ctx = this.cv.getContext('2d', { willReadFrequently: true }); } catch (e) { this.ctx = this.cv.getContext('2d'); }
+    this.prev = null; this.pts = []; this.quadros = 0; this.falhas = 0; this.pred = [0, 0]; this._t0 = 0;
+  }
+  Rastreador.prototype.iniciar = function () {
+    if (this.ativo) { return; }
+    this.ativo = true; this.prev = null; this.pts = []; this.quadros = 0; this.falhas = 0; this.pred = [0, 0];
+    this.agendar();
+  };
+  Rastreador.prototype.parar = function () {
+    this.ativo = false;
+    var v = this.p.video;
+    if (this._rvfc && v.cancelVideoFrameCallback) { try { v.cancelVideoFrameCallback(this._rvfc); } catch (e) { /* ok */ } }
+    if (this._raf) { cancelAnimationFrame(this._raf); }
+    this._rvfc = this._raf = null;
+  };
+  Rastreador.prototype.agendar = function () {
+    var self = this, v = this.p.video;
+    if (!this.ativo) { return; }
+    if (v.requestVideoFrameCallback) { this._rvfc = v.requestVideoFrameCallback(function () { self.tick(); }); }
+    else { this._raf = requestAnimationFrame(function () { self.tick(); }); }
+  };
+  Rastreador.prototype.tick = function () {
+    if (!this.ativo) { return; }
+    var agora = Date.now();
+    if (agora - this._t0 >= 45) {
+      this._t0 = agora;
+      var t1 = Date.now();
+      try { this.processar(); } catch (e) { log('rastreio', e); }
+      var gasto = Date.now() - t1;
+      if (gasto > 60 && this.lado > 160) { this.lado = 160; this.prev = null; this.pts = []; }
+    }
+    this.agendar();
+  };
+  Rastreador.prototype.processar = function () {
+    var v = this.p.video, vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh || v.readyState < 2) { return; }
+    var esc = this.lado / Math.max(vw, vh), sw = Math.round(vw * esc), sh = Math.round(vh * esc);
+    if (this.cv.width !== sw || this.cv.height !== sh) { this.cv.width = sw; this.cv.height = sh; this.prev = null; this.pts = []; }
+    this.ctx.drawImage(v, 0, 0, sw, sh);
+    var rgba = this.ctx.getImageData(0, 0, sw, sh).data, g = new Float32Array(sw * sh);
+    for (var i = 0, j = 0; i < g.length; i++, j += 4) { g[i] = rgba[j] * 0.299 + rgba[j + 1] * 0.587 + rgba[j + 2] * 0.114; }
+    var base = { d: g, w: sw, h: sh }, pir = [base, reduzir(base)];
+    var info = { esc: esc, vw: vw, vh: vh, sw: sw, sh: sh };
+    if (this.prev && this.pts.length >= 8) {
+      var a = [], b = [];
+      for (i = 0; i < this.pts.length; i++) {
+        var r = seguirPonto(this.prev, pir, this.pts[i][0], this.pts[i][1], this.pred[0], this.pred[1]);
+        if (r) { a.push(this.pts[i]); b.push(r); }
+      }
+      var m = ajustarMovimento(a, b);
+      this.ultimo = { pontos: this.pts.length, seguidos: b.length, ajuste: m ? { s: m.s, tx: m.tx, ty: m.ty, dentro: m.dentro.length } : null };
+      if (m) {
+        this.falhas = 0;
+        var novos = [];
+        for (i = 0; i < m.dentro.length; i++) { novos.push(b[m.dentro[i]]); }
+        this.pts = novos;
+        this.pred = [m.tx + (m.s - 1) * sw * 0.5, m.ty + (m.s - 1) * sh * 0.5];
+        this.p.aplicarMovimento(m, info);
+        this.p.statusRastreio(true);
+      } else {
+        this.falhas++; this.pts = []; this.pred = [0, 0];
+        if (this.falhas > 4) { this.p.statusRastreio(false); }
+      }
+    }
+    if (this.pts.length < 40 || this.quadros % 15 === 0) { this.pts = detectarCantos(base, 120); }
+    if (this.pts.length < 8 && this.quadros > 3) { this.p.statusRastreio(false); }
+    this.prev = pir;
+    this.quadros++;
+    if (this.quadros === 6) { this.p.refinarEstimativa(g, info); }
+  };
+
+  // distância até a parede pela linha onde a parede encontra o chão + inclinação do celular
+  function estimarDistancia(g, info, beta, gamma) {
+    var sw = info.sw, sh = info.sh, vw = info.vw, vh = info.vh;
+    if (beta === null || beta === undefined || vh <= vw || Math.abs(gamma || 0) > 25) { return null; }
+    var f = (Math.max(vw, vh) / 2) / Math.tan(CONFIG.campoVisaoGraus * Math.PI / 360);
+    var melhor = 0, linha = -1;
+    for (var y = Math.floor(sh * 0.45); y < sh - 3; y++) {
+      var conta = 0;
+      for (var x = 2; x < sw - 2; x++) {
+        var gy = Math.abs(g[(y + 1) * sw + x] - g[(y - 1) * sw + x]), gx = Math.abs(g[y * sw + x + 1] - g[y * sw + x - 1]);
+        if (gy > 16 && gy > gx * 1.5) { conta++; }
+      }
+      var nota = conta / (sw - 4);
+      if (nota > melhor) { melhor = nota; linha = y; }
+    }
+    if (linha < 0 || melhor < 0.5) { return null; }
+    var yv = (linha + 0.5) / info.esc;
+    var ang = (90 - beta) * Math.PI / 180 + Math.atan((yv - vh / 2) / f);
+    if (ang < 5 * Math.PI / 180 || ang > 60 * Math.PI / 180) { return null; }
+    return clamp(CONFIG.alturaCelularCm / Math.tan(ang), 80, 600);
+  }
 
   /* =====================================================================
    * Provador (UserInterface + ManualPlacement + calibração)
@@ -655,12 +887,14 @@
     this.on(window, 'orientationchange', function () { setTimeout(function () { self.relayout(); }, 300); });
     this.on(document, 'visibilitychange', function () {
       if (document.hidden && self.modo === 'camera' && CameraManager.ligada()) {
+        self.rastreador.parar();
         CameraManager.fechar(self.video); self._pausada = true;
       } else if (!document.hidden && self._pausada) {
         self._pausada = false; self.mostrarTela('pausada');
       }
     });
     this.on(window, 'pagehide', function () { CameraManager.fechar(self.video); });
+    this.rastreador = new Rastreador(this);
     requestAnimationFrame(function () { self.raiz.classList.add('on'); });
     this.prepararImagem();
     this.mostrarTela('intro');
@@ -705,6 +939,7 @@
   Provador.prototype.fechar = function () {
     if (this._fechado) { return; }
     this._fechado = true;
+    if (this.rastreador) { this.rastreador.parar(); }
     CameraManager.fechar(this.video);
     if (this._fotoUrl) { URL.revokeObjectURL(this._fotoUrl); }
     if (this._snapUrl) { URL.revokeObjectURL(this._snapUrl); }
@@ -746,6 +981,8 @@
     this.palco.appendChild(this.selo);
     this.btFoto = h('button', { class: 'obt oculto', 'aria-label': 'Tirar foto da simulação', html: ic(ICONE.camera, 28) + '<span>TIRAR FOTO</span>', onclick: function () { self.tirarFoto(); } });
     this.palco.appendChild(this.btFoto);
+    this.chipRastro = h('div', { class: 'rastro oculto' });
+    this.palco.appendChild(this.chipRastro);
     this.flash = h('div', { class: 'flash' });
     this.palco.appendChild(this.flash);
     this.toastEl = h('div', { class: 'toast', role: 'status' });
@@ -803,14 +1040,14 @@
       }
       filhos.push(h('h2', { text: 'Veja o quadro na sua parede' }));
       filhos.push(h('p', { text: 'Aponte a câmera para a parede, arraste o quadro para o lugar e ajuste o tamanho com dois dedos.' }));
-      if (!semApi) { filhos.push(btn('Abrir a câmera', 'pri', function () { self.iniciarCamera(); })); }
+      if (!semApi) { filhos.push(btn('Abrir a câmera', 'pri', function () { self.pedirSensor(); self.iniciarCamera(); })); }
       filhos.push(btn('Usar uma foto da parede', semApi ? 'pri' : 'sec', function () { self.escolherFoto(); }));
       if (interno || semApi) {
         filhos.push(h('div', { class: 'aviso', text: interno
           ? 'Você está no navegador do ' + interno + ', que pode bloquear a câmera ao vivo. Se não abrir, use uma foto da parede ou abra esta página no ' + (Compat.ios() ? 'Safari' : 'Chrome') + '.'
           : 'Este navegador não libera a câmera ao vivo. Você pode usar uma foto da parede.' }));
       }
-      filhos.push(h('p', { class: 'peq', text: 'A câmera só é usada para mostrar o quadro no seu ambiente. A imagem fica no seu celular: nada é gravado nem enviado.' }));
+      filhos.push(h('p', { class: 'peq', text: 'A câmera só é usada para mostrar o quadro no seu ambiente, e o sensor de movimento só para estimar a distância da parede. Tudo fica no seu celular: nada é gravado nem enviado.' }));
     } else if (tipo === 'carregando') {
       filhos.push(h('div', { class: 'spin' }));
       filhos.push(h('p', { class: 'peq', text: info || 'Abrindo a câmera…' }));
@@ -921,10 +1158,12 @@
     CameraManager.abrir(this.video).then(function () {
       if (self._fechado) { CameraManager.fechar(self.video); return; }
       self.modo = 'camera';
+      self.congelada = false;
       self.video.classList.remove('oculto');
       self.foto.classList.add('oculto');
       if (self.calibrado && self.refCal) { self.descalibrar(true); }
       self.entrarNoPalco();
+      self.rastreador.iniciar();
     }, function (e) {
       if (self._fechado) { return; }
       log('camera', e);
@@ -941,12 +1180,14 @@
     var self = this;
     var f = this.inputFoto.files && this.inputFoto.files[0];
     if (!f) { return; }
+    this.rastreador.parar();
     CameraManager.fechar(this.video);
     if (this._fotoUrl) { URL.revokeObjectURL(this._fotoUrl); }
     this._fotoUrl = URL.createObjectURL(f);   // a foto fica só na memória do navegador
     this.mostrarTela('carregando', 'Abrindo a foto…');
     this.foto.onload = function () {
       self.modo = 'foto';
+      self.congelada = false;
       self.foto.classList.remove('oculto');
       self.video.classList.add('oculto');
       if (self.calibrado) { self.descalibrar(true); }
@@ -970,7 +1211,10 @@
     this.btFoto.classList.remove('oculto');
     var self = this;
     requestAnimationFrame(function () {
-      if (!self.pxPorCm) { self.escalaInicial(); self.centralizar(); }
+      if (!self.pxPorCm) {
+        if (self.modo === 'camera' && self.temMedidas() && self.escalaPorDistancia(CONFIG.distanciaPadraoCm, 'padrão')) { self.centralizar(); }
+        else { self.escalaInicial(); self.centralizar(); }
+      }
       self.relayout();
       if (!self._dicaMostrada) {
         self._dicaMostrada = true;
@@ -1000,6 +1244,76 @@
     this.pxPorCm = Math.min(porAltura, porLargura);
   };
 
+  // pixels da tela por cm na parede, a partir de uma distância (cm) e do campo de visão típico
+  Provador.prototype.escalaPorDistancia = function (dCm, fonte) {
+    var v = this.video, vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) { return false; }
+    var P = this.dimsPalco(), k = Math.max(P.w / vw, P.h / vh);
+    var f = (Math.max(vw, vh) / 2) / Math.tan(CONFIG.campoVisaoGraus * Math.PI / 360);
+    var px = (f / dCm) * k, d = this.dimsQuadroCm(), alt = d.h * px;
+    if (alt < P.h * 0.08 || alt > P.h * 1.2) { return false; }   // estimativa fora do razoável: não usa
+    this.pxPorCm = px; this.estimado = true; this._mexeu = false; this.distEst = dCm; this.fonteDist = fonte;
+    this.atualizarTextos();
+    return true;
+  };
+
+  Provador.prototype.refinarEstimativa = function (g, info) {
+    if (!this.estimado || this._mexeu || this.calibrado || this.modo !== 'camera') { return; }
+    var d = estimarDistancia(g, info, this._beta, this._gamma);
+    var antes = this.pxPorCm;
+    if (d && this.escalaPorDistancia(d, 'chão')) {
+      var k = this.pxPorCm / antes;
+      var P = this.dimsPalco();
+      this.cx = P.w / 2 + (this.cx - P.w / 2) * k; this.cy = this.cy;   // mantém o quadro no mesmo lugar
+      this.render();
+      this.toast('Tamanho estimado: você parece estar a uns ' + fmt(Math.round(d / 10) / 10) + ' m da parede. Para ficar exato, calibre com uma folha A4.', 4500);
+    } else {
+      this.toast('Tamanho estimado (supondo uns ' + fmt(CONFIG.distanciaPadraoCm / 100) + ' m da parede). Para ficar exato, calibre com uma folha A4.', 4500);
+    }
+  };
+
+  Provador.prototype.pedirSensor = function () {
+    var self = this;
+    if (this._sensorLigado) { return; }
+    function ligar() {
+      if (self._sensorLigado) { return; }
+      self._sensorLigado = true;
+      self.on(window, 'deviceorientation', function (e) {
+        if (e.beta !== null && e.beta !== undefined) { self._beta = e.beta; self._gamma = e.gamma; }
+      });
+    }
+    try {
+      if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission().then(function (r) { if (r === 'granted') { ligar(); } }, function () { /* sem sensor: usa a distância padrão */ });
+      } else if (window.DeviceOrientationEvent) { ligar(); }
+    } catch (e) { /* ok */ }
+  };
+
+  // chamado pelo rastreador a cada quadro de vídeo: a imagem andou/aproximou (s, tx, ty)
+  Provador.prototype.aplicarMovimento = function (m, info) {
+    var P = this.dimsPalco(), k = Math.max(P.w / info.vw, P.h / info.vh);
+    var ox = (P.w - info.vw * k) / 2, oy = (P.h - info.vh * k) / 2, s = m.s;
+    var Tx = (1 - s) * ox + k * (m.tx / info.esc), Ty = (1 - s) * oy + k * (m.ty / info.esc);
+    if (Math.abs(s - 1) < 0.0004 && Math.abs(Tx) < 0.15 && Math.abs(Ty) < 0.15) { return; }
+    if (this.cal) {
+      var c = this.cal;
+      c.cx = s * c.cx + Tx; c.cy = s * c.cy + Ty; c.h *= s;
+      c.p1 = { x: s * c.p1.x + Tx, y: s * c.p1.y + Ty }; c.p2 = { x: s * c.p2.x + Tx, y: s * c.p2.y + Ty };
+      this.desenharCal();
+    }
+    if (this.gesto) { return; }   // a pessoa está arrastando: o dedo manda
+    this.cx = s * this.cx + Tx; this.cy = s * this.cy + Ty;
+    if (this.pxPorCm) { this.pxPorCm *= s; }   // chegou perto: o quadro cresce junto (a escala calibrada continua valendo)
+    this.render();
+  };
+
+  Provador.prototype.statusRastreio = function (ok) {
+    if (this._ultStatus === ok) { return; }
+    this._ultStatus = ok;
+    this.chipRastro.className = 'rastro ' + (ok ? 'ok' : 'busca') + (this.modo === 'camera' && !this.calAtiva ? '' : ' oculto');
+    this.chipRastro.textContent = ok ? '● Preso na parede' : 'Procurando detalhes na parede… mova devagar';
+  };
+
   Provador.prototype.centralizar = function () {
     var p = this.dimsPalco();
     this.cx = p.w / 2; this.cy = p.h * 0.46;
@@ -1017,7 +1331,9 @@
       this.cx = ancoraX + (this.cx - ancoraX) * k; this.cy = ancoraY + (this.cy - ancoraY) * k;
     }
     this.pxPorCm = novo;
+    this._mexeu = true;
     this.render();
+    this.atualizarTextos();
   };
 
   Provador.prototype.relayout = function () {
@@ -1093,9 +1409,14 @@
       this.selo.disabled = false;
     } else {
       this.selo.className = 'selo aprox' + (this.modo ? '' : ' oculto');
-      this.selo.innerHTML = '<span>Tamanho aproximado · <u>calibrar</u></span>';
+      var est = this.estimado && !this._mexeu;
+      this.selo.innerHTML = '<span>' + (est ? 'Tamanho estimado' + (this.fonteDist === 'chão' ? ' (~' + fmt(Math.round(this.distEst / 10) / 10) + ' m)' : '') : 'Tamanho aproximado') + ' · <u>calibrar</u></span>';
       this.selo.disabled = false;
     }
+    var aoVivo = this.modo === 'camera';
+    this.btFoto.innerHTML = ic(aoVivo ? ICONE.camera : ICONE.baixar, 28) + '<span>' + (aoVivo ? 'TIRAR FOTO' : 'SALVAR') + '</span>';
+    this.btFoto.setAttribute('aria-label', aoVivo ? 'Tirar foto: congela a imagem para ajustar com calma' : 'Salvar ou compartilhar a simulação');
+    this.chipRastro.classList.toggle('oculto', !aoVivo || !!this.calAtiva || this._ultStatus === undefined);
     var semMed = !this.temMedidas();
     this.btEscala.disabled = semMed;
     this.btEscala.querySelector('span').textContent = this.calibrado ? 'Sair da escala' : 'Escala real';
@@ -1268,6 +1589,7 @@
           var min = 40 / Math.max(dq.w, dq.h), max = (Math.max(p.w, p.h) * 2.5) / Math.max(dq.w, dq.h);
           var novo = clamp(g.px0 * d / g.d0, min, max), k = novo / g.px0;
           self.pxPorCm = novo;
+          if (!self._mexeu) { self._mexeu = true; self.atualizarTextos(); }
           self.cx = g.mx0 + (g.cx0 - g.mx0) * k + (mx - g.mx0);
           self.cy = g.my0 + (g.cy0 - g.my0) * k + (my - g.my0);
         } else {
@@ -1304,6 +1626,7 @@
     var self = this, p = this.dimsPalco();
     this.calAtiva = true;
     this.btFoto.classList.add('oculto');
+    this.chipRastro.classList.add('oculto');
     this.base.classList.add('oculto');
     this.quadro.classList.add('oculto');
     this.selo.classList.add('oculto');
@@ -1335,7 +1658,7 @@
     }
     bA4.onclick = function () { modo('a4'); };
     bMed.onclick = function () { modo('medida'); };
-    var aviso = this.modo === 'camera' ? h('p', { text: 'Depois de calibrar, fique no mesmo lugar: se você se aproximar ou se afastar da parede, a escala muda.' }) : null;
+    var aviso = this.modo === 'camera' ? h('p', { text: 'Dica: toque em Tirar foto antes de calibrar. A imagem congela e você ajusta com calma, até sentado.' }) : null;
     var painel = h('div', { class: 'painel' }, [
       h('h3', { text: 'Calibrar a escala real' }),
       h('div', { class: 'seg' }, [bA4, bMed]), txt, linhaCampo, aviso,
@@ -1444,9 +1767,44 @@
   };
 
   /* ---------- ScreenshotManager: foto da simulação (tudo no aparelho) ---------- */
+  // botão redondo: ao vivo congela a imagem; com a imagem parada, salva/compartilha
   Provador.prototype.tirarFoto = function () {
-    var self = this;
     if (!this.modo || this.calAtiva || this._fotografando) { return; }
+    if (this.modo === 'camera') { this.congelar(); } else { this.salvarFoto(); }
+  };
+
+  Provador.prototype.congelar = function () {
+    var self = this, v = this.video, vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) { this.toast('A câmera ainda não começou. Tente de novo em instantes.'); return; }
+    this._fotografando = true;
+    var k = Math.min(1, 2400 / Math.max(vw, vh)), c = document.createElement('canvas');
+    c.width = Math.round(vw * k); c.height = Math.round(vh * k);
+    try { c.getContext('2d').drawImage(v, 0, 0, c.width, c.height); } catch (e) { this._fotografando = false; this.toast('Não foi possível congelar a imagem.'); return; }
+    this.flash.classList.add('on');
+    setTimeout(function () { self.flash.classList.remove('on'); }, 60);
+    function pronto(blob) {
+      if (!blob || self._fechado) { self._fotografando = false; return; }
+      if (self._fotoUrl) { URL.revokeObjectURL(self._fotoUrl); }
+      self._fotoUrl = URL.createObjectURL(blob);   // fica só na memória do navegador
+      self.foto.onload = function () {
+        self._fotografando = false;
+        self.rastreador.parar();
+        CameraManager.fechar(self.video);
+        self.modo = 'foto'; self.congelada = true;
+        self.foto.classList.remove('oculto');
+        self.video.classList.add('oculto');
+        self.atualizarTextos();
+        self.toast('Imagem congelada. Ajuste com calma (arrastar, tamanho, calibrar) e toque em Salvar quando terminar.', 4500);
+      };
+      self.foto.onerror = function () { self._fotografando = false; self.toast('Não foi possível congelar a imagem.'); };
+      self.foto.src = self._fotoUrl;
+    }
+    if (c.toBlob) { c.toBlob(pronto, 'image/jpeg', 0.92); }
+    else { this._fotografando = false; this.toast('Este navegador não consegue congelar a imagem.'); }
+  };
+
+  Provador.prototype.salvarFoto = function () {
+    var self = this;
     var fonte = this.modo === 'camera' ? this.video : this.foto;
     var fw = this.modo === 'camera' ? fonte.videoWidth : fonte.naturalWidth;
     var fh = this.modo === 'camera' ? fonte.videoHeight : fonte.naturalHeight;
@@ -1523,7 +1881,8 @@
       h('p', { class: 'dica', text: dica }),
       h('div', { class: 'linhaBtns' }, [
         h('button', { class: 'btn sec', text: 'Voltar', onclick: function () { fechar(); } }),
-        h('button', { class: 'btn pri', html: 'Salvar foto', onclick: function () { salvar(); } })
+        podeCompartilhar ? h('button', { class: 'btn sec', text: 'Compartilhar', onclick: function () { compartilhar(); } }) : null,
+        h('button', { class: 'btn pri', html: 'Salvar', onclick: function () { salvar(); } })
       ])
     ]);
     function fechar() { if (previa.parentNode) { previa.parentNode.removeChild(previa); } }
@@ -1532,7 +1891,14 @@
       a.href = self._snapUrl; a.download = nome; a.rel = 'noopener';
       self.root.appendChild(a); a.click(); self.root.removeChild(a);
     }
+    function compartilhar() {
+      navigator.share({ files: [arquivo], title: 'Meu quadro Maperia' }).then(null, function (e) {
+        if (e && e.name !== 'AbortError') { self.toast('Não foi possível compartilhar. Use Salvar.'); }
+      });
+    }
     function salvar() {
+      if (!Compat.ios()) { baixar(); return; }
+      // no iPhone o "baixar" não vai para a galeria: o menu de compartilhar tem "Salvar imagem"
       if (podeCompartilhar) {
         navigator.share({ files: [arquivo], title: 'Meu quadro Maperia' }).then(null, function (e) {
           if (e && e.name === 'AbortError') { return; }   // a pessoa só fechou o menu
