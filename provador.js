@@ -13,7 +13,7 @@
   'use strict';
 
   if (window.__maperiaProvador) { return; }
-  var API = window.__maperiaProvador = { versao: '0.7.1' };
+  var API = window.__maperiaProvador = { versao: '0.7.2' };
 
   /* =====================================================================
    * CONFIGURAÇÃO CENTRAL
@@ -69,7 +69,7 @@
     // ?provador=teste no endereço (vale para a sessão inteira do navegador).
     // Para liberar para todos os clientes, trocar para false.
     // Para sair do teste no aparelho: abrir com ?provador=sair.
-    modoTeste: true,
+    modoTeste: false,
     corPadrao: '#00b4ef',      // azul da loja, usado se não der para ler a cor do botão Comprar
     alturaInicialTela: 0.42,   // no modo aproximado, o quadro abre com 42% da altura da tela
     maxImagensAnalisadas: 14,  // limite de fotos da galeria testadas atrás da foto isolada
