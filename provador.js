@@ -1,6 +1,6 @@
 /*!
  * Provador virtual de quadros — Maperia
- * Versão 0.7.0 (AR em destaque, foto no AR do iPhone, dois toques no Android) — 26/11/2026
+ * Versão 0.7.1 (só em quadros; recusa fotos comparativas) — 26/11/2026
  *
  * Instalação: Google Tag Manager, tag "HTML personalizado" (ver README.md).
  * Tudo roda no navegador do visitante: nada é enviado a servidores,
@@ -13,7 +13,7 @@
   'use strict';
 
   if (window.__maperiaProvador) { return; }
-  var API = window.__maperiaProvador = { versao: '0.7.0' };
+  var API = window.__maperiaProvador = { versao: '0.7.1' };
 
   /* =====================================================================
    * CONFIGURAÇÃO CENTRAL
@@ -40,8 +40,31 @@
       '/produtos/quadro-mapa-mundi-cortica-luxo-gigante-125-x-84-cm/': {
         tamanhos: { 'Gigante': { larguraCm: 125, alturaCm: 84 } },
         molduraCm: 1.5
+      },
+      '/produtos/quadro-decorativo-mapa-mundi-cortica-luxo-com-50-alfinetes-medio-63-x-46-cm/': {
+        tamanhos: { 'Médio': { larguraCm: 63, alturaCm: 46 } },
+        molduraCm: 1.5
+      },
+      // Brasil Cortiça Luxo: horizontal (knowledge/produtos/linhas.md; Letícia, 08/11/2026); uma página por tamanho
+      '/produtos/quadro-mapa-brasil-cortica-luxo-medio-63x42cm-50-alfinetes-de-bolinha-de-brinde-6rr86/': {
+        tamanhos: { 'Médio': { larguraCm: 63, alturaCm: 42 } },
+        molduraCm: 1.5
+      },
+      '/produtos/quadro-mapa-brasil-cortica-luxo-grande-83x56cm-50-alfinetes-de-bolinha-de-brinde-1wuoh/': {
+        tamanhos: { 'Grande': { larguraCm: 83, alturaCm: 56 } },
+        molduraCm: 1.5
+      },
+      '/produtos/quadro-mapa-brasil-cortica-luxo-gigante-125x84cm-50-alfinetes-de-bolinha-de-brinde-ymkb5/': {
+        tamanhos: { 'Gigante': { larguraCm: 125, alturaCm: 84 } },
+        molduraCm: 1.5
       }
     },
+    // páginas onde o provador NÃO aparece (peças personalizadas ou recortadas, sem moldura retangular)
+    excluir: [
+      '/produtos/mapa-personalizado/',
+      '/produtos/mapa-brasil-cortica-com-divisas-grande-60-x-61-cm/',
+      '/produtos/mapa-mundi-mdf-preto/'
+    ],
     // MODO TESTE: com true, o botão só aparece para quem abrir a loja com
     // ?provador=teste no endereço (vale para a sessão inteira do navegador).
     // Para liberar para todos os clientes, trocar para false.
@@ -156,7 +179,7 @@
         if (!url || !nome) { return; }
         if (url.indexOf('//') === 0) { url = 'https:' + url; }
         var cam = normalizarCaminho(url.replace(/^https?:\/\/[^\/]+/, ''));
-        if (!/^\/produtos\//.test(cam) || cam === aqui || vistos[cam]) { return; }
+        if (!/^\/produtos\//.test(cam) || cam === aqui || vistos[cam] || CONFIG.excluir.indexOf(cam) >= 0) { return; }
         vistos[cam] = 1;
         lista.push({ url: url, caminho: cam, nome: nome.replace(/\s*\+.*$/, '').trim(), img: img || '' });
       }
@@ -383,11 +406,30 @@
       if (fy[0] < 0 || fx[0] < 0) { return null; }
       var caixa = { x: fx[0] / w, y: fy[0] / hh, w: (fx[1] - fx[0] + 1) / w, h: (fy[1] - fy[0] + 1) / hh };
       if (caixa.w * caixa.h < 0.12 || caixa.w > 0.98 || caixa.h > 0.98) { return null; }
-      return { caixa: caixa };
+      // mais de um objeto separado por branco (ex.: Grande ao lado do Médio): não serve
+      function buraco(arr, a, b, total) {
+        var run = 0, maior = 0;
+        for (var i = a; i <= b; i++) { if (arr[i] <= total * 0.02) { run++; if (run > maior) { maior = run; } } else { run = 0; } }
+        return maior;
+      }
+      var cw = fx[1] - fx[0] + 1, ch = fy[1] - fy[0] + 1;
+      if (buraco(colunas, fx[0], fx[1], hh) >= Math.max(3, cw * 0.03) || buraco(linhas, fy[0], fy[1], w) >= Math.max(3, ch * 0.03)) { return null; }
+      return { caixa: caixa, proporcao: (cw / w * img.naturalWidth) / (ch / hh * img.naturalHeight) };
     },
     // procura na galeria a primeira foto de fundo branco
-    acharIsolada: function (doc) {
+    acharIsolada: function (doc, tamanhos) {
       var lista = this.urlsDaGaleria(doc).slice(0, CONFIG.maxImagensAnalisadas);
+      function confere(prop) {
+        var l = (tamanhos && tamanhos.lista) || [], tem = false;
+        for (var k = 0; k < l.length; k++) {
+          if (!l[k].larguraCm) { continue; }
+          tem = true;
+          var r = l[k].larguraCm / l[k].alturaCm;
+          if (Math.abs(Math.log(prop / r)) < 0.08) { return true; }
+          if (!l[k].orientacaoConfirmada && Math.abs(Math.log(prop * r)) < 0.08) { return true; }
+        }
+        return !tem;   // sem medidas: não dá para conferir
+      }
       var self = this, i = 0, houveCors = false;
       return new Promise(function (ok) {
         function prox() {
@@ -396,7 +438,10 @@
           self.carregar(item.pequena).then(function (img) {
             var r = self.analisar(img);
             if (r && r.erro) { houveCors = true; prox(); return; }
-            if (r && r.caixa) { log('foto isolada', item.grande, r.caixa); ok({ achou: true, item: item, caixa: r.caixa, lista: lista }); return; }
+            if (r && r.caixa) {
+              if (!confere(r.proporcao)) { log('foto recusada (proporção não bate)', item.grande, r.proporcao); prox(); return; }
+              log('foto isolada', item.grande, r.caixa); ok({ achou: true, item: item, caixa: r.caixa, lista: lista }); return;
+            }
             prox();
           }, function () { prox(); });
         }
@@ -1479,7 +1524,7 @@
   Provador.prototype.prepararImagem = function () {
     var self = this, token = this._imgToken = (this._imgToken || 0) + 1;
     function velho() { return self._fechado || token !== self._imgToken; }
-    ProductImageManager.acharIsolada(this.produto.doc).then(function (r) {
+    ProductImageManager.acharIsolada(this.produto.doc, this.tamanhos).then(function (r) {
       if (velho()) { return; }
       if (!r.achou) {
         self.imgStatus = r.cors ? 'erro' : 'sem-isolada';
@@ -2483,7 +2528,7 @@
       camera: Compat.temCamera(),
       navegadorInterno: Compat.navegadorInterno()
     };
-    return ProductImageManager.acharIsolada().then(function (r) {
+    return ProductImageManager.acharIsolada(document, t).then(function (r) {
       out.fotoIsolada = r.achou ? { url: r.item.grande, caixa: r.caixa } : (r.cors ? 'bloqueada por CORS' : 'não encontrada');
       return out;
     });
@@ -2511,6 +2556,11 @@
     try {
       if (!liberadoNesteAparelho()) { return; }
       if (!ProductDetector.ehPaginaDeProduto()) { return; }
+      if (CONFIG.excluir.indexOf(normalizarCaminho(location.pathname)) >= 0) { return; }
+      var tams = ProductDimensions.tamanhos(ProductDetector.ler());
+      var temMedida = false;
+      for (var i = 0; i < tams.lista.length; i++) { if (tams.lista[i].larguraCm) { temMedida = true; } }
+      if (!temMedida) { return; }   // alfinetes, bonés etc.: sem botão
       if (inserirBotao()) { return; }
       // o formulário ainda não apareceu: observa por no máximo 8 s e desliga
       var obs = new MutationObserver(function () { if (inserirBotao()) { obs.disconnect(); } });
